@@ -85,12 +85,12 @@ def run_demo(
     
     # 2. Initialize Embeddings & Head
     # We use a fixed embedding to map byte tokens to semantic space
-    embedding = nn.Embedding(vocab_size, d_model).to(device)
+    embedding = nn.Embedding(vocab_size, d_model).to(device).bfloat16()
     # Freeze embedding parameters to demonstrate purely local layer-wise learning
     for p in embedding.parameters():
         p.requires_grad = False
         
-    lm_head = LMHead(d_model, vocab_size).to(device)
+    lm_head = LMHead(d_model, vocab_size).to(device).bfloat16()
     if optimizer_type.lower() == "sgd":
         lm_optimizer = torch.optim.SGD(lm_head.parameters(), lr=1e-3, momentum=0.9)
     else:
@@ -98,12 +98,12 @@ def run_demo(
     
     # 3. Initialize BioLLM Layers
     layers = [
-        SparkBrainBlock(d_model=d_model, num_experts=num_experts, expert_dim=expert_dim).to(device)
+        SparkBrainBlock(d_model=d_model, num_experts=num_experts, expert_dim=expert_dim).to(device).bfloat16()
         for _ in range(num_layers)
     ]
     
     # 4. Initialize Hippocampal Memory
-    memory = HippocampalMemory(d_model=d_model, memory_size=512, decay_rate=0.98).to(device)
+    memory = HippocampalMemory(d_model=d_model, memory_size=512, decay_rate=0.98).to(device).bfloat16()
     
     # 5. Initialize Local Trainer
     trainer = LocalBrainTrainer(layers, lr=5e-4, local_hebbian_rate=0.005, optimizer_type=optimizer_type)
@@ -122,7 +122,22 @@ def run_demo(
     # 6. Initialize Background Saver for non-blocking checkpoints
     bg_saver = BackgroundSaver()
     
-    # 7. Initialize Streaming DataLoader
+    # 7. Initialize Transformer Engine (TE) Native FP4 Context
+    from biollm.layers.nvfp4 import HAS_TE
+    if HAS_TE:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import Format, NVFP4BlockScaling
+        print("Transformer Engine detected. Enabling native Blackwell NVFP4 (E2M1) training...")
+        recipe = NVFP4BlockScaling()
+        def native_fp4_autocast():
+            return te.autocast(enabled=True, recipe=recipe)
+    else:
+        import contextlib
+        print("Transformer Engine not detected. Falling back to simulated FP4 training...")
+        def native_fp4_autocast():
+            return contextlib.nullcontext()
+            
+    # 8. Initialize Streaming DataLoader
     print("Initializing streamed dataloader for HuggingFaceFW/fineweb-edu...")
     dataloader = get_dataloader(batch_size=batch_size, seq_len=seq_len)
     data_iter = iter(dataloader)
@@ -132,86 +147,96 @@ def run_demo(
     print("-" * 60)
     
     start_time = time.time()
-    for step in range(1, max_steps + 1):
-        try:
-            x, y = next(data_iter)
-        except StopIteration:
-            print("Dataset stream ended.")
-            break
+    try:
+        for step in range(1, max_steps + 1):
+            try:
+                x, y = next(data_iter)
+            except StopIteration:
+                print("Dataset stream ended.")
+                break
+                
+            x = x.to(device)
+            y = y.to(device)
             
-        x = x.to(device)
-        y = y.to(device)
-        
-        # Mapping inputs and targets to semantic representations
-        with torch.no_grad():
-            input_embeddings = embedding(x)  # [batch, seq_len, d_model]
-            target_embeddings = embedding(y) # [batch, seq_len, d_model]
+            # Mapping inputs and targets to semantic representations
+            with torch.no_grad():
+                input_embeddings = embedding(x)  # [batch, seq_len, d_model]
+                target_embeddings = embedding(y) # [batch, seq_len, d_model]
+                
+            # Read from Hippocampal episodic memory to retrieve context
+            retrieved_context = memory.read(input_embeddings, temperature=0.5)
             
-        # Read from Hippocampal episodic memory to retrieve context
-        retrieved_context = memory.read(input_embeddings, temperature=0.5)
-        
-        # Integrate episodic memory context
-        layer_input = input_embeddings + retrieved_context
-        
-        # Run local trainer step (backprop isolated to each block)
-        local_losses = trainer.local_train_step(layer_input, target_embeddings)
-        
-        # Run forward pass without gradients to compute final output and update LM head
-        with torch.no_grad():
-            hidden = layer_input.clone()
-            for layer in layers:
-                hidden = layer(hidden)
-            final_output = hidden
+            # Integrate episodic memory context
+            layer_input = input_embeddings + retrieved_context
             
-        # Update LM Head (local classification update)
-        lm_optimizer.zero_grad()
-        # Normalize representations before linear projection to avoid logit saturation
-        norm_final_output = (final_output - final_output.mean(dim=-1, keepdim=True)) / (final_output.std(dim=-1, keepdim=True) + 1e-5)
-        logits = lm_head(norm_final_output) # [batch, seq_len, vocab_size]
-        lm_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
-        lm_loss.backward()
-        
-        # Apply gradient clipping to LM Head to prevent logit magnitude explosion
-        torch.nn.utils.clip_grad_norm_(lm_head.parameters(), max_norm=1.0)
-        lm_optimizer.step()
-        
-        # Write step context to Hippocampal memory (associate inputs with final semantic outputs)
-        # Flatten batch and sequence dimensions for memory storage
-        flat_keys = input_embeddings.view(-1, d_model)
-        flat_vals = final_output.view(-1, d_model)
-        # Write a fraction to keep it fast
-        memory.write(flat_keys[:16], flat_vals[:16])
-        
-        # Speed logging
-        elapsed = time.time() - start_time
-        tokens_processed = step * batch_size * seq_len
-        tokens_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
-        
-        if step % 10 == 0 or step == 1:
-            mean_layer_loss = sum(local_losses) / len(local_losses)
-            print(f"{step:<6} | {mean_layer_loss:<16.4f} | {lm_loss.item():<12.4f} | {tokens_per_sec:.1f}")
+            # Run local trainer step and LM head updates under native FP4 autocast context
+            with native_fp4_autocast():
+                # Run local trainer step (backprop isolated to each block)
+                local_losses = trainer.local_train_step(layer_input, target_embeddings)
+                
+                # Run forward pass without gradients to compute final output and update LM head
+                with torch.no_grad():
+                    hidden = layer_input.clone()
+                    for layer in layers:
+                        hidden = layer(hidden)
+                    final_output = hidden
+                    
+                # Update LM Head (local classification update)
+                lm_optimizer.zero_grad()
+                # Normalize representations before linear projection to avoid logit saturation
+                norm_final_output = (final_output - final_output.mean(dim=-1, keepdim=True)) / (final_output.std(dim=-1, keepdim=True) + 1e-5)
+                logits = lm_head(norm_final_output) # [batch, seq_len, vocab_size]
+                lm_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+                lm_loss.backward()
+                
+                # Apply gradient clipping to LM Head to prevent logit magnitude explosion
+                torch.nn.utils.clip_grad_norm_(lm_head.parameters(), max_norm=1.0)
+                lm_optimizer.step()
             
-        # Save intermediate checkpoints to allow interruption and resuming
-        if step % 100 == 0:
-            checkpoint = {
-                "embedding": embedding.state_dict(),
-                "layers": [layer.state_dict() for layer in layers],
-                "lm_head": lm_head.state_dict(),
-                "memory_keys": memory.keys,
-                "memory_values": memory.values,
-                "memory_strengths": memory.strengths,
-            }
-            checkpoint_path = "biollm_checkpoint.pt"
-            bg_saver.save(checkpoint, checkpoint_path)
-            print(f" -> [Step {step}] Intermediate checkpoint write triggered in background...")
+            # Write step context to Hippocampal memory (associate inputs with final semantic outputs)
+            # Flatten batch and sequence dimensions for memory storage
+            flat_keys = input_embeddings.view(-1, d_model)
+            flat_vals = final_output.view(-1, d_model)
+            # Write a fraction to keep it fast
+            memory.write(flat_keys[:16], flat_vals[:16])
             
-        # Periodic garbage collection and cache clearing to prevent memory leak accumulation
-        if step % 50 == 0:
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Speed logging
+            elapsed = time.time() - start_time
+            tokens_processed = step * batch_size * seq_len
+            tokens_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
             
+            if step % 10 == 0 or step == 1:
+                mean_layer_loss = sum(local_losses) / len(local_losses)
+                print(f"{step:<6} | {mean_layer_loss:<16.4f} | {lm_loss.item():<12.4f} | {tokens_per_sec:.1f}")
+                
+            # Save intermediate checkpoints to allow interruption and resuming
+            if step % 100 == 0:
+                checkpoint = {
+                    "embedding": embedding.state_dict(),
+                    "layers": [layer.state_dict() for layer in layers],
+                    "lm_head": lm_head.state_dict(),
+                    "memory_keys": memory.keys,
+                    "memory_values": memory.values,
+                    "memory_strengths": memory.strengths,
+                }
+                checkpoint_path = "biollm_checkpoint.pt"
+                bg_saver.save(checkpoint, checkpoint_path)
+                print(f" -> [Step {step}] Intermediate checkpoint write triggered in background...")
+                
+            # Periodic garbage collection and cache clearing to prevent memory leak accumulation
+            if step % 50 == 0:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user (Ctrl+C). Cleaning up background threads...")
+        if bg_saver.thread is not None and bg_saver.thread.is_alive():
+            print("Waiting for active background checkpoint saving to complete...")
+            bg_saver.thread.join()
+        print("Exited cleanly.")
+        return
+        
     print("-" * 80)
     
     # Wait for any active background saving to complete before final save

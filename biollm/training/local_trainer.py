@@ -68,8 +68,8 @@ class LocalBrainTrainer:
             std_y = torch.sqrt(torch.var(delta, dim=0) + 1e-4)
             variance_loss = torch.mean(F.relu(1.0 - std_y))
             
-            # Combine losses: maximize alignment, minimize dense activity, prevent collapse
-            local_loss = -target_alignment + (0.1 * sparsity_penalty) + (0.5 * variance_loss)
+            # Combine losses: maximize alignment (using cosine distance), minimize dense activity, prevent collapse
+            local_loss = (1.0 - target_alignment) + (0.1 * sparsity_penalty) + (0.5 * variance_loss)
             
             # Trigger isolated backward pass
             local_loss.backward()
@@ -77,8 +77,20 @@ class LocalBrainTrainer:
             # Local Anti-Hebbian updates for the lateral inhibition matrix
             with torch.no_grad():
                 tokens = layer_input.view(-1, layer_input.size(-1))
+                # Check and pad tokens to a multiple of 16 for excitatory router
+                N_tokens = tokens.size(0)
+                pad_tokens = (16 - (N_tokens % 16)) % 16
+                if pad_tokens > 0:
+                    padded_tokens = F.pad(tokens, (0, 0, 0, pad_tokens))
+                else:
+                    padded_tokens = tokens
+                    
                 # Re-compute excitation for router updates
-                excitation = F.relu(layer.excitatory_router(tokens))
+                padded_excitation = F.relu(layer.excitatory_router(padded_tokens))
+                if pad_tokens > 0:
+                    excitation = padded_excitation[:N_tokens, :layer.num_experts]
+                else:
+                    excitation = padded_excitation[:, :layer.num_experts]
                 
                 # Outer product of co-activations
                 co_activation = torch.matmul(excitation.T, excitation) / (tokens.size(0) + 1e-8)

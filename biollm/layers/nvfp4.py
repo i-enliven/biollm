@@ -2,6 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Check for native NVIDIA Transformer Engine (TE) support on DGX OS / Blackwell
+HAS_TE = False
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, NVFP4BlockScaling
+    HAS_TE = True
+except (ImportError, ModuleNotFoundError):
+    pass
+
 class E2M1Quantizer(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, block_size=32):
@@ -48,7 +57,7 @@ class E2M1Quantizer(torch.autograd.Function):
             quantized_flat_x = quantized_flat_x[:-pad_len]
             
         return quantized_flat_x.view(orig_shape)
-
+    
     @staticmethod
     def backward(ctx, grad_output):
         # Straight-Through Estimator (STE)
@@ -61,23 +70,32 @@ def quantize_to_fp4_e2m1(x, block_size=32):
     """
     return E2M1Quantizer.apply(x, block_size)
 
-class NVFP4Linear(nn.Module):
-    """
-    Linear layer simulating NVIDIA Blackwell NVFP4 (E2M1) quantization for weights and activations.
-    """
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, block_size: int = 32):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.block_size = block_size
-        
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter('bias', None)
+if HAS_TE:
+    class NVFP4Linear(te.Linear):
+        """
+        Hardware-native NVIDIA Blackwell FP4/FP8 linear layer wrapper.
+        """
+        def __init__(self, in_features: int, out_features: int, bias: bool = True, block_size: int = 32):
+            # te.Linear handles native execution on Blackwell hardware
+            super().__init__(in_features, out_features, bias=bias)
+else:
+    class NVFP4Linear(nn.Module):
+        """
+        Linear layer simulating NVIDIA Blackwell NVFP4 (E2M1) quantization for weights and activations.
+        """
+        def __init__(self, in_features: int, out_features: int, bias: bool = True, block_size: int = 32):
+            super().__init__()
+            self.in_features = in_features
+            self.out_features = out_features
+            self.block_size = block_size
             
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        quantized_weight = quantize_to_fp4_e2m1(self.weight, self.block_size)
-        quantized_x = quantize_to_fp4_e2m1(x, self.block_size)
-        return F.linear(quantized_x, quantized_weight, self.bias)
+            self.weight = nn.Parameter(torch.randn(out_features, in_features) * 0.02)
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(out_features))
+            else:
+                self.register_parameter('bias', None)
+                
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            quantized_weight = quantize_to_fp4_e2m1(self.weight, self.block_size)
+            quantized_x = quantize_to_fp4_e2m1(x, self.block_size)
+            return F.linear(quantized_x, quantized_weight, self.bias)

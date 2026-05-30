@@ -18,7 +18,9 @@ class SparkBrainBlock(nn.Module):
         self.ln = nn.LayerNorm(d_model)
         
         # Sparse Excitatory Router (quantized)
-        self.excitatory_router = NVFP4Linear(d_model, num_experts)
+        # TE requires output features to be a multiple of 16 for NVFP4 execution
+        router_out_features = ((num_experts + 15) // 16) * 16
+        self.excitatory_router = NVFP4Linear(d_model, router_out_features)
         
         # Lateral Inhibition Matrix (The Brain's localized braking system)
         self.raw_inhibitory_weights = nn.Parameter(torch.ones(num_experts, num_experts) * 0.15)
@@ -40,13 +42,25 @@ class SparkBrainBlock(nn.Module):
         normalized_x = self.ln(x)
         tokens = normalized_x.view(-1, d_model)
         
+        # Check and pad tokens to a multiple of 16 for excitatory router
+        N_tokens = tokens.size(0)
+        pad_tokens = (16 - (N_tokens % 16)) % 16
+        if pad_tokens > 0:
+            padded_tokens = F.pad(tokens, (0, 0, 0, pad_tokens))
+        else:
+            padded_tokens = tokens
+            
         # Step 1: Fire Initial Excitatory pathways 
-        excitation = F.relu(self.excitatory_router(tokens))
+        padded_excitation = F.relu(self.excitatory_router(padded_tokens))
+        if pad_tokens > 0:
+            excitation = padded_excitation[:N_tokens, :self.num_experts]
+        else:
+            excitation = padded_excitation[:, :self.num_experts]
         
         # Step 2: Enforce Lateral Inhibition (E/I Settling loop)
         # Avoid in-place modification of autograd variables (fill_diagonal_) by using a mask
         raw_inhib = F.relu(self.raw_inhibitory_weights)
-        diagonal_mask = torch.eye(self.num_experts, device=self.raw_inhibitory_weights.device)
+        diagonal_mask = torch.eye(self.num_experts, device=self.raw_inhibitory_weights.device, dtype=self.raw_inhibitory_weights.dtype)
         inhibitory_matrix = raw_inhib * (1.0 - diagonal_mask)
         
         inhibition = torch.zeros_like(excitation)
@@ -68,8 +82,17 @@ class SparkBrainBlock(nn.Module):
                 continue
                 
             selected_tokens = tokens[mask]
+            N_selected = selected_tokens.size(0)
+            pad_selected = (16 - (N_selected % 16)) % 16
+            if pad_selected > 0:
+                padded_selected = F.pad(selected_tokens, (0, 0, 0, pad_selected))
+            else:
+                padded_selected = selected_tokens
+                
             # Run calculations inside the NVFP4 expert layer
-            expert_out = self.experts[expert_idx](selected_tokens)
+            expert_out = self.experts[expert_idx](padded_selected)
+            if pad_selected > 0:
+                expert_out = expert_out[:N_selected]
             
             # Apply dynamic neural amplitude scaling
             scale = final_routing_scores[mask, expert_idx].unsqueeze(-1)

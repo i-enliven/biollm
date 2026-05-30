@@ -111,25 +111,29 @@ Run the default demo with custom model dimensions, batch size, sequence length, 
 - Use `--optimizer sgd` to cut optimizer state memory in half (saves ~25 GB RAM).
 
 ```bash
-PYTHONPATH=. uv run python3 run_demo.py \
+NVTE_NVFP4_DISABLE_RHT=1 NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1 NVTE_BACKWARD_OVERRIDE=dequantized PYTHONPATH=. uv run python3 run_demo.py \
   --steps 10000 \
   --d_model 4096 \
   --expert_dim 12288 \
-  --experts 4 \
+  --experts 8 \
   --layers 16 \
   --batch_size 64 \
   --seq_len 128 \
-  --optimizer sgd
+  --optimizer adamw
 ```
 
 Customize parameters or resume training from an existing checkpoint:
 ```bash
-PYTHONPATH=. uv run python3 run_demo.py \
-  --steps 15000 \
-  --resume \
+NVTE_NVFP4_DISABLE_RHT=1 NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING=1 NVTE_BACKWARD_OVERRIDE=dequantized PYTHONPATH=. uv run python3 run_demo.py \
+  --steps 10000 \
+  --d_model 4096 \
+  --expert_dim 12288 \
+  --experts 8 \
+  --layers 16 \
   --batch_size 64 \
   --seq_len 128 \
-  --optimizer sgd
+  --optimizer adamw \
+  --resume
 ```
 
 ### Running inference

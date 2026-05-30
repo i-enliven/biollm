@@ -40,7 +40,7 @@ def run_inference(
     # Auto-detect hyperparameters from tensor shapes
     d_model = checkpoint["embedding"]["weight"].shape[1]
     num_layers = len(checkpoint["layers"])
-    num_experts = checkpoint["layers"][0]["excitatory_router.weight"].shape[0]
+    num_experts = checkpoint["layers"][0]["raw_inhibitory_weights"].shape[0]
     # Under nn.Sequential in experts: experts[0][0] is NVFP4Linear(d_model, expert_dim)
     expert_dim = checkpoint["layers"][0]["experts.0.0.weight"].shape[0]
     
@@ -51,13 +51,13 @@ def run_inference(
     print(f" - num_layers: {num_layers}")
     
     # 1. Initialize Architecture
-    embedding = nn.Embedding(vocab_size, d_model).to(device)
-    lm_head = LMHead(d_model, vocab_size).to(device)
+    embedding = nn.Embedding(vocab_size, d_model).to(device).bfloat16()
+    lm_head = LMHead(d_model, vocab_size).to(device).bfloat16()
     layers = [
-        SparkBrainBlock(d_model=d_model, num_experts=num_experts, expert_dim=expert_dim).to(device)
+        SparkBrainBlock(d_model=d_model, num_experts=num_experts, expert_dim=expert_dim).to(device).bfloat16()
         for _ in range(num_layers)
     ]
-    memory = HippocampalMemory(d_model=d_model, memory_size=512, decay_rate=0.98).to(device)
+    memory = HippocampalMemory(d_model=d_model, memory_size=512, decay_rate=0.98).to(device).bfloat16()
     
     # 2. Load Weights from Checkpoint
     embedding.load_state_dict(checkpoint["embedding"])
@@ -75,6 +75,20 @@ def run_inference(
         layers = [torch.compile(layer) for layer in layers]
         lm_head = torch.compile(lm_head)
     
+    # Initialize Transformer Engine (TE) Native FP4 Context
+    from biollm.layers.nvfp4 import HAS_TE
+    if HAS_TE:
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import Format, NVFP4BlockScaling
+        print("Transformer Engine detected. Enabling native Blackwell NVFP4 (E2M1) inference...")
+        recipe = NVFP4BlockScaling()
+        def native_fp4_autocast():
+            return te.autocast(enabled=True, recipe=recipe)
+    else:
+        import contextlib
+        def native_fp4_autocast():
+            return contextlib.nullcontext()
+    
     
     # 3. Process Input Prompt
     # Convert string prompt to byte token IDs
@@ -89,48 +103,20 @@ def run_inference(
     
     # 4. Prefill Phase (process initial prompt context in one batch pass)
     with torch.no_grad():
-        prompt_embeddings = embedding(input_ids) # [1, prompt_len, d_model]
-        retrieved_context = memory.read(prompt_embeddings, temperature=0.5)
-        hidden = prompt_embeddings + retrieved_context
-        
-        for layer in layers:
-            hidden = layer(hidden)
-            
-        # Write prompt states to episodic memory
-        flat_keys = prompt_embeddings[0].view(-1, d_model)
-        flat_vals = hidden[0].view(-1, d_model)
-        memory.write(flat_keys, flat_vals)
-        
-        # Get initial logits for the last token in prompt to seed loop
-        norm_hidden = (hidden - hidden.mean(dim=-1, keepdim=True)) / (hidden.std(dim=-1, keepdim=True) + 1e-5)
-        logits = lm_head(norm_hidden[:, -1, :])
-        
-        if temperature > 0:
-            probs = F.softmax(logits / temperature, dim=-1)
-            next_token_id = torch.multinomial(probs, num_samples=1).item()
-        else:
-            next_token_id = torch.argmax(logits, dim=-1).item()
-            
-        generated_bytes.append(next_token_id)
-        try:
-            char = bytes([next_token_id]).decode("utf-8")
-            print(char, end="", flush=True)
-        except UnicodeDecodeError:
-            pass
-
-    # 5. O(1) Autoregressive Generation Loop (process only the newly generated token)
-    for _ in range(max_tokens - 1):
-        with torch.no_grad():
-            token_input = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
-            token_embedding = embedding(token_input) # [1, 1, d_model]
-            
-            # Read episodic memory context for single new token
-            retrieved_context = memory.read(token_embedding, temperature=0.5)
-            hidden = token_embedding + retrieved_context
+        with native_fp4_autocast():
+            prompt_embeddings = embedding(input_ids) # [1, prompt_len, d_model]
+            retrieved_context = memory.read(prompt_embeddings, temperature=0.5)
+            hidden = prompt_embeddings + retrieved_context
             
             for layer in layers:
                 hidden = layer(hidden)
                 
+            # Write prompt states to episodic memory
+            flat_keys = prompt_embeddings[0].view(-1, d_model)
+            flat_vals = hidden[0].view(-1, d_model)
+            memory.write(flat_keys, flat_vals)
+            
+            # Get initial logits for the last token in prompt to seed loop
             norm_hidden = (hidden - hidden.mean(dim=-1, keepdim=True)) / (hidden.std(dim=-1, keepdim=True) + 1e-5)
             logits = lm_head(norm_hidden[:, -1, :])
             
@@ -146,9 +132,39 @@ def run_inference(
                 print(char, end="", flush=True)
             except UnicodeDecodeError:
                 pass
+
+    # 5. O(1) Autoregressive Generation Loop (process only the newly generated token)
+    for _ in range(max_tokens - 1):
+        with torch.no_grad():
+            with native_fp4_autocast():
+                token_input = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
+                token_embedding = embedding(token_input) # [1, 1, d_model]
                 
-            # Write only the newly generated token state to episodic memory
-            memory.write(token_embedding[0].view(-1, d_model), hidden[0].view(-1, d_model))
+                # Read episodic memory context for single new token
+                retrieved_context = memory.read(token_embedding, temperature=0.5)
+                hidden = token_embedding + retrieved_context
+                
+                for layer in layers:
+                    hidden = layer(hidden)
+                    
+                norm_hidden = (hidden - hidden.mean(dim=-1, keepdim=True)) / (hidden.std(dim=-1, keepdim=True) + 1e-5)
+                logits = lm_head(norm_hidden[:, -1, :])
+                
+                if temperature > 0:
+                    probs = F.softmax(logits / temperature, dim=-1)
+                    next_token_id = torch.multinomial(probs, num_samples=1).item()
+                else:
+                    next_token_id = torch.argmax(logits, dim=-1).item()
+                    
+                generated_bytes.append(next_token_id)
+                try:
+                    char = bytes([next_token_id]).decode("utf-8")
+                    print(char, end="", flush=True)
+                except UnicodeDecodeError:
+                    pass
+                    
+                # Write only the newly generated token state to episodic memory
+                memory.write(token_embedding[0].view(-1, d_model), hidden[0].view(-1, d_model))
                 
     # Final full decode to handle any trailing characters
     final_output = bytes(generated_bytes).decode("utf-8", errors="replace")
