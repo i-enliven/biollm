@@ -1,10 +1,38 @@
 import os
 import time
 import argparse
+import threading
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from biollm import SparkBrainBlock, HippocampalMemory, LocalBrainTrainer, get_dataloader
+
+class BackgroundSaver:
+    def __init__(self):
+        self.thread = None
+
+    def save(self, checkpoint_data, path):
+        if self.thread is not None and self.thread.is_alive():
+            print("\n -> Warning: Previous checkpoint save is still in progress. Skipping this save step to avoid disk contention.")
+            return False
+            
+        self.thread = threading.Thread(
+            target=self._run_save, 
+            args=(checkpoint_data, path),
+            daemon=True
+        )
+        self.thread.start()
+        return True
+
+    def _run_save(self, checkpoint_data, path):
+        try:
+            temp_path = path + ".tmp"
+            torch.save(checkpoint_data, temp_path)
+            if os.path.exists(temp_path):
+                os.replace(temp_path, path)
+                print(f"\n -> [Background Save] Checkpoint saved successfully to {path}")
+        except Exception as e:
+            print(f"\n -> [Background Save] Error saving checkpoint: {e}")
 
 class LMHead(nn.Module):
     """
@@ -91,7 +119,10 @@ def run_demo(
         memory.strengths.copy_(checkpoint["memory_strengths"])
         print("Resumed training state successfully.")
     
-    # 6. Initialize Streaming DataLoader
+    # 6. Initialize Background Saver for non-blocking checkpoints
+    bg_saver = BackgroundSaver()
+    
+    # 7. Initialize Streaming DataLoader
     print("Initializing streamed dataloader for HuggingFaceFW/fineweb-edu...")
     dataloader = get_dataloader(batch_size=batch_size, seq_len=seq_len)
     data_iter = iter(dataloader)
@@ -171,8 +202,8 @@ def run_demo(
                 "memory_strengths": memory.strengths,
             }
             checkpoint_path = "biollm_checkpoint.pt"
-            torch.save(checkpoint, checkpoint_path)
-            print(f" -> [Step {step}] Intermediate checkpoint saved to {checkpoint_path}")
+            bg_saver.save(checkpoint, checkpoint_path)
+            print(f" -> [Step {step}] Intermediate checkpoint write triggered in background...")
             
         # Periodic garbage collection and cache clearing to prevent memory leak accumulation
         if step % 50 == 0:
@@ -183,6 +214,11 @@ def run_demo(
             
     print("-" * 80)
     
+    # Wait for any active background saving to complete before final save
+    if bg_saver.thread is not None and bg_saver.thread.is_alive():
+        print("Waiting for background checkpoint save to complete before final write...")
+        bg_saver.thread.join()
+        
     # Save the trained weights and memory states to a file
     checkpoint = {
         "embedding": embedding.state_dict(),

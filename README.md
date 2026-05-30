@@ -132,9 +132,10 @@ PYTHONPATH=. uv run python3 run_demo.py \
   --optimizer sgd
 ```
 
-### Runing inference
+### Running inference
+Run inference on a trained checkpoint. To compile the model blocks and speed up execution, append the `--compile` flag:
 ```bash
-PYTHONPATH=. uv run python3 run_inference.py --prompt "Biological networks are" --tokens 20
+PYTHONPATH=. uv run python3 run_inference.py --prompt "Biological networks are" --tokens 100 --compile
 ```
 
 ### Running Tests
