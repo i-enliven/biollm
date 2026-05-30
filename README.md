@@ -107,14 +107,29 @@ uv sync
 ### Running the Demo
 The demo streams text data from `HuggingFaceFW/fineweb-edu`, tokenizes it at the byte level, and trains a multi-layer BioLLM network using backprop-free local learning and hippocampal episodic retrieval.
 
-Run the default demo (1,000 steps):
+Run the default demo with custom model dimensions, batch size, sequence length, and optimizer options. To run within 128 GB memory limits:
+- Use `--optimizer sgd` to cut optimizer state memory in half (saves ~25 GB RAM).
+
 ```bash
-PYTHONPATH=. uv run python3 run_demo.py --steps 1000 --d_model 4096 --expert_dim 12288 --experts 4 --layers 16
+PYTHONPATH=. uv run python3 run_demo.py \
+  --steps 10000 \
+  --d_model 4096 \
+  --expert_dim 12288 \
+  --experts 4 \
+  --layers 16 \
+  --batch_size 64 \
+  --seq_len 128 \
+  --optimizer sgd
 ```
 
-Customize the step limit and resume training from a saved checkpoint:
+Customize parameters or resume training from an existing checkpoint:
 ```bash
-PYTHONPATH=. uv run python3 run_demo.py --steps 10000 --resume
+PYTHONPATH=. uv run python3 run_demo.py \
+  --steps 15000 \
+  --resume \
+  --batch_size 64 \
+  --seq_len 128 \
+  --optimizer sgd
 ```
 
 ### Runing inference

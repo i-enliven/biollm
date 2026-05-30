@@ -8,15 +8,21 @@ class LocalBrainTrainer:
     Manages localized, backpropagation-free training for the Brain-Inspired LLM.
     Updates are calculated layer-by-layer using predictive coding objectives.
     """
-    def __init__(self, model_layers: List[nn.Module], lr: float = 1e-3, local_hebbian_rate: float = 0.01):
+    def __init__(self, model_layers: List[nn.Module], lr: float = 1e-3, local_hebbian_rate: float = 0.01, optimizer_type: str = "adamw"):
         self.layers = model_layers
         self.lr = lr
         self.hebbian_rate = local_hebbian_rate
+        self.optimizer_type = optimizer_type
         
         # Track local optimizer states independently for each layer
-        self.optimizers = [
-            torch.optim.AdamW(layer.parameters(), lr=self.lr) for layer in self.layers
-        ]
+        if self.optimizer_type.lower() == "sgd":
+            self.optimizers = [
+                torch.optim.SGD(layer.parameters(), lr=self.lr, momentum=0.9) for layer in self.layers
+            ]
+        else:
+            self.optimizers = [
+                torch.optim.AdamW(layer.parameters(), lr=self.lr) for layer in self.layers
+            ]
 
     def local_train_step(self, batch_inputs: torch.Tensor, target_tokens: torch.Tensor) -> List[float]:
         """
@@ -92,7 +98,7 @@ class LocalBrainTrainer:
             # Store loss value for monitoring
             layer_losses.append(local_loss.item())
             
-            # Pass output to the next layer
-            current_hidden_state = layer_output
+            # Pass output to the next layer (detached to release computational graph)
+            current_hidden_state = layer_output.detach()
             
         return layer_losses

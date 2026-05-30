@@ -23,7 +23,10 @@ def run_demo(
     d_model: int = 256,
     expert_dim: int = 1024,
     num_experts: int = 8,
-    num_layers: int = 3
+    num_layers: int = 3,
+    batch_size: int = 8,
+    seq_len: int = 64,
+    optimizer_type: str = "adamw"
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"==================================================")
@@ -32,8 +35,6 @@ def run_demo(
     
     # Hyperparameters
     vocab_size = 256  # Byte-level vocabulary
-    seq_len = 64
-    batch_size = 8
     
     # 1. Load Checkpoint first to auto-detect architecture configuration if resuming
     checkpoint_path = "biollm_checkpoint.pt"
@@ -62,7 +63,10 @@ def run_demo(
         p.requires_grad = False
         
     lm_head = LMHead(d_model, vocab_size).to(device)
-    lm_optimizer = torch.optim.AdamW(lm_head.parameters(), lr=1e-3)
+    if optimizer_type.lower() == "sgd":
+        lm_optimizer = torch.optim.SGD(lm_head.parameters(), lr=1e-3, momentum=0.9)
+    else:
+        lm_optimizer = torch.optim.AdamW(lm_head.parameters(), lr=1e-3)
     
     # 3. Initialize BioLLM Layers
     layers = [
@@ -74,7 +78,7 @@ def run_demo(
     memory = HippocampalMemory(d_model=d_model, memory_size=512, decay_rate=0.98).to(device)
     
     # 5. Initialize Local Trainer
-    trainer = LocalBrainTrainer(layers, lr=5e-4, local_hebbian_rate=0.005)
+    trainer = LocalBrainTrainer(layers, lr=5e-4, local_hebbian_rate=0.005, optimizer_type=optimizer_type)
     
     # 6. Apply state dicts if checkpoint is loaded
     if checkpoint is not None:
@@ -170,6 +174,13 @@ def run_demo(
             torch.save(checkpoint, checkpoint_path)
             print(f" -> [Step {step}] Intermediate checkpoint saved to {checkpoint_path}")
             
+        # Periodic garbage collection and cache clearing to prevent memory leak accumulation
+        if step % 50 == 0:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
     print("-" * 80)
     
     # Save the trained weights and memory states to a file
@@ -225,6 +236,25 @@ if __name__ == "__main__":
         default=3, 
         help="Number of layer blocks in the model (default: 3)"
     )
+    parser.add_argument(
+        "--batch_size", 
+        type=int, 
+        default=8, 
+        help="Batch size for training (default: 8)"
+    )
+    parser.add_argument(
+        "--seq_len", 
+        type=int, 
+        default=64, 
+        help="Sequence length context window (default: 64)"
+    )
+    parser.add_argument(
+        "--optimizer", 
+        type=str, 
+        choices=["adamw", "sgd"], 
+        default="adamw", 
+        help="Optimizer to use for training (default: adamw)"
+    )
     args = parser.parse_args()
     run_demo(
         max_steps=args.steps, 
@@ -232,7 +262,10 @@ if __name__ == "__main__":
         d_model=args.d_model,
         expert_dim=args.expert_dim,
         num_experts=args.experts,
-        num_layers=args.layers
+        num_layers=args.layers,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        optimizer_type=args.optimizer
     )
 
 
